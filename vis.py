@@ -1,8 +1,11 @@
 from typing import Tuple, List
 from argparse import ArgumentParser, BooleanOptionalAction
 from PIL import Image
+from matplotlib.colors import Colormap
 from matplotlib.pyplot import cm
+import matplotlib.pyplot as plt
 from random import randint, random
+import numpy as np
 from tqdm import tqdm
 import sys
 
@@ -11,13 +14,16 @@ import vtkmodules.vtkInteractionStyle
 # noinspection PyUnresolvedReferences
 import vtkmodules.vtkRenderingOpenGL2
 from vtkmodules.vtkCommonColor import vtkNamedColors
+from vtkmodules.vtkCommonCore import VTK_UNSIGNED_CHAR
+from vtkmodules.vtkCommonDataModel import vtkImageData
 from vtkmodules.vtkFiltersSources import vtkCylinderSource
 from vtkmodules.vtkRenderingCore import (
     vtkActor,
+    vtkVolume,
     vtkPolyDataMapper,
     vtkRenderWindow,
     vtkRenderWindowInteractor,
-    vtkRenderer
+    vtkRenderer, vtkImageMapper, vtkActor2D
 )
 
 IM_WIDTH = 2048
@@ -25,6 +31,7 @@ IM_HEIGHT = 2048
 IM_BG_COLOR = "#000000"
 IM_FILE = "./jwst-image.png"
 GALAXY_IMG_FILE = "./galaxy-icon-0.png"
+GALAXY_COLORMAP = "rainbow"
 GALAXY_MAX_WIDTH = 64
 GALAXY_MAX_HEIGHT = 64
 GALAXY_MAX_COUNT = 10000
@@ -33,6 +40,10 @@ GALAXY_MAX_TRIES = 5
 
 def hex_to_colour(hex_string: str) -> Tuple[int, ...]:
     return tuple(map(int, bytes.fromhex(hex_string.lstrip("#"))))[:3]
+
+
+def get_random_color(colormap: Colormap) -> Tuple[int, ...]:
+    return tuple(map(lambda x: int(255.0 * x), colormap(random())))
 
 
 class BoundingBox:
@@ -78,22 +89,20 @@ class BoundingBox:
             bb.bottom > self.top and bb.top < self.bottom
 
 
-def get_color() -> Tuple[int, ...]:
-    return tuple(map(lambda x: int(255.0 * x), cm.rainbow(random())))
-
-
 def main_simulation(
-    im_size,
-    im_bg_color,
-    im_file,
-    galaxy_img_file,
-    galaxy_max_width,
-    galaxy_max_height,
-    galaxy_max_count,
-    galaxy_max_tries
+    im_size: Tuple[int, int],
+    im_bg_color: str,
+    im_file: str,
+    galaxy_colormap: str,
+    galaxy_img_file: str,
+    galaxy_max_width: int,
+    galaxy_max_height: int,
+    galaxy_max_count: int,
+    galaxy_max_tries: int
 ) -> int:
     print("Generating simulated image...", end="")
 
+    colormap: Colormap = cm.get_cmap(galaxy_colormap)
     image: Image = Image.new("RGB", im_size, hex_to_colour(im_bg_color))
 
     with Image.open(galaxy_img_file) as galaxy_image:
@@ -122,7 +131,7 @@ def main_simulation(
                 if any(proposed_bounding_box.intersects(bounding_box) for bounding_box in bounding_boxes):
                     continue
 
-                colored_image: Image = Image.new("RGBA", transformed_galaxy.size, get_color())
+                colored_image: Image = Image.new("RGBA", transformed_galaxy.size, get_random_color(colormap))
 
                 image.paste(colored_image, proposed_bounding_box.pos, mask=transformed_galaxy)
                 bounding_boxes.append(proposed_bounding_box)
@@ -136,8 +145,49 @@ def main_simulation(
     return 0
 
 
-def main_vis() -> int:
+def depth_function(data: np.ndarray, invert: bool = False) -> np.ndarray:
+    return 1.0 - np.sqrt(1.0 - data) if invert else np.sqrt(1.0 - data)
+
+
+def plot_colourmap(colormap: Colormap, correct_depth: bool, seg_count: int = 1000, save: bool = True):
+    xs = np.linspace(0.0, 1.0, seg_count)
+    ys = colormap(xs)
+    plt.figure(figsize=(8, 8), dpi=80)
+    if correct_depth:
+        plt.plot(xs, depth_function(ys[:, 2]), "b")
+    else:
+        plt.plot(xs, ys[:, 0], "r", xs, ys[:, 1], "g", xs, ys[:, 2], "b")
+    if save:
+        plt.savefig("depth-function.png" if correct_depth else "colourmap.png")
+    else:
+        plt.show()
+    plt.clf()
+
+
+def load_depths(image: Image) -> np.ndarray:
+    return depth_function(np.array(image).astype(float)[:, :, 2] / 255.0)
+
+
+def load_galaxy_mask(image: Image) -> np.ndarray:
+    return np.any(np.array(image)[:, :], axis=2)
+
+
+def main_vis(im_file: str, galaxy_colormap: Colormap) -> int:
     print("Starting visualisation...", end="")
+
+    plot_colourmap(cm.get_cmap(galaxy_colormap), False)
+    plot_colourmap(cm.get_cmap(galaxy_colormap), True)
+
+    with Image.open(im_file) as image:
+        image: Image = image.convert("RGB")
+
+        image_array: np.ndarray = np.array(image)
+
+        depths = load_depths(image) * 255.0
+        galaxy_mask = load_galaxy_mask(image)
+
+        Image.fromarray(depths.astype(np.uint8)).save("jwst-image-depth.png")
+        Image.fromarray(galaxy_mask).save("jwst-image-galaxy-mask.png")
 
     colors = vtkNamedColors()
     # Set the background color.
@@ -170,6 +220,24 @@ def main_vis() -> int:
     # perform appropriate camera or actor manipulation depending on the
     # nature of the events.
     ren = vtkRenderer()
+
+    img_mapper = vtkImageMapper()
+    img_actor = vtkActor2D()
+    image_data = vtkImageData()
+    image_data.SetDimensions(image_array.shape[0], image_array.shape[1], 1)
+    image_data.AllocateScalars(VTK_UNSIGNED_CHAR, 3)
+    for x in range(0, image_array.shape[0]):
+        for y in range(0, image_array.shape[1]):
+            for c in range(0, 3):
+                # pixel = image_data.GetScalarPointer(x, y, 0)
+                image_data.SetScalarComponentFromFloat(x, y, 0, c, image_array[x, y, c])
+                # pixel = np.array(image_array[x, y, :])
+    img_mapper.SetInputData(image_data)
+    img_mapper.SetColorWindow(255)
+    img_mapper.SetColorLevel(127.5)
+    img_actor.SetMapper(img_mapper)
+    ren.AddActor(img_actor)
+
     ren_win = vtkRenderWindow()
     ren_win.AddRenderer(ren)
     # noinspection PyArgumentList
@@ -241,6 +309,13 @@ def main() -> int:
         help="Path to galaxy image file."
     )
     parser.add_argument(
+        "--galaxy-colourmap",
+        dest="galaxy_colormap",
+        type=str,
+        default=GALAXY_COLORMAP,
+        help="Colormap for use in random galaxy generation."
+    )
+    parser.add_argument(
         "--galaxy-max-width",
         dest="galaxy_max_width",
         type=int,
@@ -291,6 +366,7 @@ def main() -> int:
         (args.im_width, args.im_height),
         args.im_bg_color,
         args.im_file,
+        args.galaxy_colormap,
         args.galaxy_img_file,
         args.galaxy_max_width,
         args.galaxy_max_height,
@@ -299,7 +375,7 @@ def main() -> int:
     )):
         return err_code
 
-    if args.vis and (err_code := main_vis()):
+    if args.vis and (err_code := main_vis(args.im_file, args.galaxy_colormap)):
         return err_code
 
     return 0
